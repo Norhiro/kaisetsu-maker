@@ -1,27 +1,36 @@
+import wx
+import wx.grid
+import wx.lib.scrolledpanel
+
 import os
-import glob
-import requests
-import json
-import moviepy.editor as mp
-#from moviepy.editor import CompositeVideoClip
-from PIL import Image, ImageDraw, ImageFont
-import numpy as np
-import wave
 import re
-import random
-import tkinter as tk
-from tkinter import ttk
-from tkinter import messagebox
-from tkinter import filedialog
+import json
+
+import threading
+import queue
+
+#import PySimpleGUI as sg
+import gloour
+import requests
+
+import moviepy.editor as mp
+from moviepy.video.io.ffmpeg_writer import FFMPEG_VideoWriter
 import ffmpeg
+from PIL import Image, ImageDraw, ImageFont
+import wave
+from proglog import ProgressBarLogger
+
+import numpy as np
+import random
+
 import pandas as pd
-import traceback
 from scipy.io import wavfile
 import shutil
 
-resolution=(1920, 1080)
+resolution = (1920, 1080)
 default_character_order = None
-
+fps = 30
+output = "output.mp4"
 
 class VoiceGenerator:
     def __init__(self, base_url="http://localhost:50021"):
@@ -33,7 +42,7 @@ class VoiceGenerator:
             "text": text,
             "speaker": speaker_id
         }
-        query = requests.post(f"{self.base_url}/audio_query", params=params)
+        query = requests.post(f"{self.base_url}/audio_query", params=params)   ################################################### 改善個所　VOICE VOX 起動確認
         if query.status_code != 200:
             raise Exception(f"VoiceVox API query error: {query.status_code}")
 
@@ -72,7 +81,8 @@ class Animator:
     def __init__(self, character='ずんだもん', speaker=1, resolution=resolution):
         self.character = character
         self.speaker = speaker
-        self.fps = 24
+        #self.fps = 24
+        self.fps = fps
         self.resolution = resolution
         self.images = self.load_images(character)
         self.voice_generator = VoiceGenerator()
@@ -81,33 +91,31 @@ class Animator:
         os.makedirs('json', exist_ok=True)
         os.makedirs('video', exist_ok=True)
 
-
     def add_text(self, image, text, font_size, font_color, border_color, position):
         draw = ImageDraw.Draw(image)
-        #font_path = "arial.ttf"  # フォントファイルへのパスを指定
-        font_path = "font/NotoSansJP-Medium.otf"  #"arial.ttf"  # フォントファイルへのパスを指定
+        font_path = "font/NotoSansJP-Medium.otf"
         font = ImageFont.truetype(font_path, font_size)
-        
+
         lines = text.split('\n')
         max_width = 0
         total_height = 0
-        
+
         for line in lines:
             text_bbox = draw.textbbox((0, 0), line, font=font)
             text_width, text_height = text_bbox[2] - text_bbox[0], text_bbox[3] - text_bbox[1]
             if text_width > max_width:
                 max_width = text_width
             total_height += text_height
-        
+
         width, height = image.size
-        
+
         if position == "center":
             y_offset = (height - total_height) / 2
         elif position == "bottom":
             y_offset = height - total_height - 50
         else:
-            y_offset = 10  # デフォルトの位置（左上）
-        
+            y_offset = 10
+
         for line in lines:
             text_bbox = draw.textbbox((0, 0), line, font=font)
             text_width, text_height = text_bbox[2] - text_bbox[0], text_bbox[3] - text_bbox[1]
@@ -116,21 +124,17 @@ class Animator:
             elif position == "bottom":
                 x = (width - text_width) / 2
             else:
-                x = 10  # デフォルトの位置（左上）
+                x = 10
 
-            # テキストの縁取り
-            draw.text((x-1, y_offset-1), line, font=font, fill=border_color)
-            draw.text((x+1, y_offset-1), line, font=font, fill=border_color)
-            draw.text((x-1, y_offset+1), line, font=font, fill=border_color)
-            draw.text((x+1, y_offset+1), line, font=font, fill=border_color)
-            
-            # テキスト本体
+            draw.text((x - 1, y_offset - 1), line, font=font, fill=border_color)
+            draw.text((x + 1, y_offset - 1), line, font=font, fill=border_color)
+            draw.text((x - 1, y_offset + 1), line, font=font, fill=border_color)
+            draw.text((x + 1, y_offset + 1), line, font=font, fill=border_color)
             draw.text((x, y_offset), line, font=font, fill=font_color)
-            
+
             y_offset += text_height
-        
+
         return image
-      
 
     def load_images(self, character):
         image_sets = {
@@ -169,24 +173,42 @@ class Animator:
         return volumes, duration
 
     def create_silence(self, duration, fps):
-        return mp.AudioClip(lambda t: [0, 0], duration=duration).set_fps(fps)
+        return mp.AudioClip(lambda t: [0, 0], duration=duration).set_fps(self.fps)
 
-    def create_animation(self, text, position="center", speaker_id=1, volume=1.0, silent=False, title_settings=None, subtitle_settings=None):
+    def create_animation(self, text, position="center", 
+                        speaker_id=1, volume=1.0, silence_duration=0, 
+                        title_settings=None, subtitle_settings=None, 
+                        progress_callback=None):
         print("Starting to create animation")
-        segments = re.split(r'(\d+)', text)
+        silence_duration = int(silence_duration)
+        if volume == 0:
+            text = '[' + str(silence_duration) + ']'
+        print(text)
+        #segments = re.split(r'(\d+)', text)
+        #segments = re.split(r'(\d+|\n)', text)
+        segments = re.split(r'(\n)', text)
+        segments = [item for item in segments if item]
+        print(segments)
+
         audio_clips = []
         total_duration = 0
         default_pause = 5
         font_path = "font/NotoSansJP-Medium.otf"
 
-
-        for segment in segments:
+        for i, segment in enumerate(segments):
             segment = segment.strip()
-            if segment.isdigit():
-                pause_duration = int(segment)
-                silence_clip = self.create_silence(pause_duration, 44100)
-                audio_clips.append(silence_clip)
-                total_duration += pause_duration
+            #if segment.isdigit() and i< len(segments) and segments[i-1] == '[' and segments[i+1] == ']':
+            if len(segment) >2 and segment[0] == "[" and segment[-1] == "]" and segment[1:-2].isdigit():
+                        pause_duration = int(segment[1:-1])
+                        silence_clip = self.create_silence(pause_duration, 44100)
+                        audio_clips.append(silence_clip)
+                        total_duration += pause_duration
+            elif segment == '\n':
+                        pass
+                        #pause_duration = 1
+                        #silence_clip = self.create_silence(pause_duration, 44100)
+                        #audio_clips.append(silence_clip)
+                        #total_duration += pause_duration
             elif segment:
                 print(f"Generating voice for segment: {segment}")
                 audio_file = self.voice_generator.generate_voice(segment, speaker_id, f"temp/audio_{self.clip_counter}.wav")
@@ -199,7 +221,6 @@ class Animator:
                 self.clip_counter += 1
 
         final_audio = mp.concatenate_audioclips(audio_clips)
-
         final_audio_path = "final_audio.wav"
         final_audio.write_audiofile(final_audio_path)
         volumes, _ = self.get_audio_volume(final_audio_path)
@@ -217,7 +238,7 @@ class Animator:
                 else:
                     image = self.images['normal']
             elif volume < 3000:
-                if frame in blink_times:       
+                if frame in blink_times:
                     image = self.images['close_eye_mid_mouth']
                 else:
                     image = self.images['open_eye_mid_mouth']
@@ -231,18 +252,8 @@ class Animator:
             img = Image.open(image).convert("RGBA")
             img_resized = img.resize((int(img.width * (self.resolution[1] / img.height)), self.resolution[1]), Image.Resampling.LANCZOS)
 
-            # 背景の透過PNGをキャラクター画像と同じサイズで作成
             transparent_bg = Image.new('RGBA', img_resized.size, (0, 0, 0, 0))
-
-            # 背景とキャラクター画像を合成
             combined = Image.alpha_composite(transparent_bg, img_resized)
-
-            # タイトルとサブタイトルの追加（原画の上に文字の表示がある）
-            #if title_settings and title_settings["start_time"] <= t <= title_settings["start_time"] + title_settings["duration"]:
-            #    combined = self.add_text(combined, title_settings["text"], title_settings["font_size"], title_settings["font_color"], title_settings["border_color"], position="center")
-            
-            #if subtitle_settings and subtitle_settings["start_time"] <= t <= subtitle_settings["start_time"] + subtitle_settings["duration"]:
-            #    combined = self.add_text(combined, subtitle_settings["text"], subtitle_settings["font_size"], subtitle_settings["font_color"], subtitle_settings["border_color"], position="bottom")
 
             return combined
 
@@ -252,13 +263,15 @@ class Animator:
             frame_path = f'temp/frame_{int(t * self.fps):04d}.png'
             frame.save(frame_path)
             pngs.append(frame_path)
+            if progress_callback:
+                progress_callback(50 + int(t / total_duration * 25))
+
 
         video = mp.ImageSequenceClip(pngs, fps=self.fps)
 
         video = video.set_audio(final_audio)
         video = video.set_fps(self.fps)
 
-        # キャラクターの位置を設定
         if position == "left_25":
             x_pos = int(self.resolution[0] * 0.25 - video.size[0] / 2)
             video = video.set_position((x_pos, 'center'))
@@ -276,15 +289,12 @@ class Animator:
         else:
             video = video.set_position('center')
 
-        # JSONファイルの連番を取得
         existing_json_files = glob.glob('json/output_*.json')
         json_file_number = len(existing_json_files) + 1
 
-        # 動画ファイルのパスを設定
         mov_file = f'video/output_{json_file_number}.mov'
         mp4_file = f'video/output_{json_file_number}.mp4'
 
-        # Create transparent MOV file
         bgpng = 'temp/bg.png'
         bgmov = 'temp/bg.mov'
         img = Image.new('RGBA', (self.resolution[0], self.resolution[1]), (0, 0, 0, 0))
@@ -300,8 +310,7 @@ class Animator:
         background_clip = mp.VideoFileClip(bgmov, has_mask=True).set_duration(total_duration)
         final_clip = mp.CompositeVideoClip([background_clip, video], size=self.resolution)
        
-          # タイトルとサブタイトルの追加
-        if title_settings['text'] != "":
+        if title_settings and title_settings["text"] != "":
             title_clip = mp.TextClip(
                 title_settings["text"], fontsize=title_settings["font_size"], color=title_settings["font_color"], bg_color='transparent', 
                 font=font_path, size=(self.resolution[0], None), 
@@ -311,20 +320,25 @@ class Animator:
 
             final_clip = mp.CompositeVideoClip([final_clip, title_clip], size=self.resolution)
 
-        if subtitle_settings['text'] != "":
+        if subtitle_settings and subtitle_settings["text"] != "":
             subtitle_clip = mp.TextClip(
                 subtitle_settings["text"], fontsize=subtitle_settings["font_size"], color=subtitle_settings["font_color"], bg_color='transparent', font=font_path, size=(self.resolution[0], None), method='caption'
             ).set_position(('center', 'bottom')).set_duration(subtitle_settings["duration"]).set_start(subtitle_settings["start_time"])
             final_clip = mp.CompositeVideoClip([final_clip, subtitle_clip], size=self.resolution)
 
-        final_clip.write_videofile(mov_file, codec="qtrle", fps=self.fps)
+        # カスタムロガーを設定
+        if progress_callback:
+            print(progress_callback)
+            
+            logger = WriteVideoProgress(progress_callback)
+            final_clip.write_videofile(mov_file, codec="qtrle", fps=self.fps, logger=logger)  ####################
+        else:
+             final_clip.write_videofile(mov_file, codec="qtrle", fps=self.fps)
 
-        # Create gray background MP4 file
         gray_bg = mp.ColorClip(size=self.resolution, color=(128, 128, 128)).set_duration(total_duration).set_fps(self.fps)
         final_clip_with_gray_bg = mp.CompositeVideoClip([gray_bg, video], size=self.resolution)
         final_clip_with_gray_bg.write_videofile(mp4_file, codec="libx264", fps=self.fps, ffmpeg_params=["-pix_fmt", "yuv420p"])
 
-        #レイヤ
         global default_character_order
         if default_character_order is None:
             default_character_order = {self.character: 1}
@@ -335,10 +349,9 @@ class Animator:
             layer = max(default_character_order.values()) +1
             default_character_order.setdefault(self.character, layer)
 
-        # JSONファイルの作成
         json_data = {
-            "mov_file": mov_file,
-            "mp4_file": mp4_file,
+            "mov_file": os.path.basename(mov_file),
+            "mp4_file": os.path.basename(mp4_file),
             "text": text,
             "layer": layer,
             "position": position,
@@ -351,843 +364,786 @@ class Animator:
             "subtitle_settings": subtitle_settings
         }
     
-        json_output_path = f'json/output_{json_file_number}.json'
-    
+        json_output_path = f'json/output_{json_file_number}.json'   # Json 書き出し    
         with open(json_output_path, 'w', encoding='utf-8') as f:
             json.dump(json_data, f, ensure_ascii=False, indent=4)
 
-        return mov_file, mp4_file
-
-class AnimationGUI:
-    def __init__(self, root):
-        print("Initializing GUI")
-        self.root = root
-        self.root.title("アニメーション生成 GUI")
-
-        #self.tree_insert = None
-        self.tree_insert = []
-        self.bg_tree_insert = []
-        self.cell_value = None 
-
-        self.character_data = {
-            "ずんだもん": {
-                "ノーマル": 3,
-                "あまあま": 1,
-                "ツンツン": 7,
-                "セクシー": 5,
-                "ささやき": 22,
-                "ヒソヒソ": 38,
-                "ヘロヘロ": 75,
-                "なみだめ": 76
-            },
-            "四国めたん": {
-                "ノーマル": 2,
-                "あまあま": 0,
-                "ツンツン": 6,
-                "セクシー": 4,
-                "ささやき": 36,
-                "ヒソヒソ": 37
-            }
-        }
-
-        self.layer_options = [[1 ,"一番前"],[2  ,"2番目"],[3 ,"3番目"],[4  ,"4番目"],[5 ,"5番目"]]
-
-        self.animator = Animator()
-        self.create_widgets()
-        self.load_existing_json_files()
-
-        # Treeviewにダブルクリックイベントをバインド
-        self.tree.bind("<Double-1>", self.on_double_click)
-
-    def create_widgets(self):
-        print("Creating widgets")
-        frame = ttk.Frame(self.root, padding="10")
-        frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-
-        ttk.Label(frame, text="キャラクター").grid(row=0, column=0)
-        self.character_var = tk.StringVar()
-        self.character_menu = ttk.Combobox(frame, textvariable=self.character_var, state="readonly")
-        self.character_menu["values"] = list(self.character_data.keys())
-        self.character_menu.grid(row=0, column=1)
-        self.character_menu.bind("<<ComboboxSelected>>", self.update_style_menu)
-
-        ttk.Label(frame, text="声色").grid(row=1, column=0)
-        self.style_var = tk.StringVar()
-        self.style_menu = ttk.Combobox(frame, textvariable=self.style_var, state="readonly")
-        self.style_menu.grid(row=1, column=1)
-
-        ttk.Label(frame, text="セリフ").grid(row=2, column=0)
-        self.text_entry = tk.Text(frame, height=5, width=60)
-        self.text_entry.grid(row=2, column=1, columnspan=5, sticky=tk.W)
-
-        ttk.Label(frame, text="横位置").grid(row=3, column=0)
-        self.position_var = tk.StringVar(value="center")
-        position_options = ["hidden", "left_10", "left_25", "center", "right_25", "right_10"]
-        for i, position in enumerate(position_options):
-            ttk.Radiobutton(frame, text=position, variable=self.position_var, value=position).grid(row=3, column=i+1, sticky=tk.W)
-
-        ttk.Label(frame, text="開始タイミング (秒)").grid(row=4, column=0)
-        self.start_time_entry = ttk.Entry(frame)
-        self.start_time_entry.grid(row=4, column=1)
-
-        ttk.Label(frame, text="ボリューム").grid(row=5, column=0)
-        self.volume_entry = ttk.Entry(frame)
-        self.volume_entry.grid(row=5, column=1)
-        self.volume_entry.insert(0, "1.0")
-
-        self.silence_button = ttk.Button(frame, text="無音", command=self.set_silence)
-        self.silence_button.grid(row=5, column=2)
-        self.silence_entry = ttk.Entry(frame)
-        self.silence_entry.grid(row=5, column=3)
-        self.silence_entry.insert(0, "5.0")
-        ttk.Label(frame, text="無音アニメーションの秒数指定　指定なしだと5秒").grid(row=5, column=4, sticky=tk.W)
-
-        # タイトル設定ウィジェット
-        ttk.Label(frame, text="タイトル").grid(row=6, column=0)
-        self.title_text = tk.Text(frame, height=2, width=60)
-        self.title_text.grid(row=6, column=1, columnspan=5, sticky=tk.W)
-
-        ttk.Label(frame, text="タイトルフォントサイズ").grid(row=7, column=0)
-        self.title_font_size = ttk.Entry(frame)
-        self.title_font_size.grid(row=7, column=1)
-        self.title_font_size.insert(0, "40")
-
-        ttk.Label(frame, text="タイトルフォント色").grid(row=7, column=2)
-        self.title_font_color = ttk.Entry(frame)
-        self.title_font_color.grid(row=7, column=3)
-        self.title_font_color.insert(0, "white")
-
-        ttk.Label(frame, text="タイトル縁取り色").grid(row=7, column=4)
-        self.title_border_color = ttk.Entry(frame)
-        self.title_border_color.grid(row=7, column=5)
-        self.title_border_color.insert(0, "black")
-
-        ttk.Label(frame, text="タイトル開始タイミング (秒)").grid(row=8, column=0)
-        self.title_start_time = ttk.Entry(frame)
-        self.title_start_time.grid(row=8, column=1)
-        self.title_start_time.insert(0, "0")
-
-        ttk.Label(frame, text="タイトルduration (秒)").grid(row=8, column=2)
-        self.title_duration = ttk.Entry(frame)
-        self.title_duration.grid(row=8, column=3)
-        self.title_duration.insert(0, "5")
-
-        # サブタイトル設定ウィジェット
-        ttk.Label(frame, text="サブタイトル").grid(row=9, column=0)
-        self.subtitle_text = tk.Text(frame, height=2, width=60)
-        self.subtitle_text.grid(row=9, column=1, columnspan=5, sticky=tk.W)
-
-        ttk.Label(frame, text="サブタイトルフォントサイズ").grid(row=10, column=0)
-        self.subtitle_font_size = ttk.Entry(frame)
-        self.subtitle_font_size.grid(row=10, column=1)
-        self.subtitle_font_size.insert(0, "30")
-
-        ttk.Label(frame, text="サブタイトルフォント色").grid(row=10, column=2)
-        self.subtitle_font_color = ttk.Entry(frame)
-        self.subtitle_font_color.grid(row=10, column=3)
-        self.subtitle_font_color.insert(0, "white")
-
-        ttk.Label(frame, text="サブタイトル縁取り色").grid(row=10, column=4)
-        self.subtitle_border_color = ttk.Entry(frame)
-        self.subtitle_border_color.grid(row=10, column=5)
-        self.subtitle_border_color.insert(0, "black")
-
-        ttk.Label(frame, text="サブタイトル開始タイミング (秒)").grid(row=11, column=0)
-        self.subtitle_start_time = ttk.Entry(frame)
-        self.subtitle_start_time.grid(row=11, column=1)
-        self.subtitle_start_time.insert(0, "0")
-
-        ttk.Label(frame, text="サブタイトルduration (秒)").grid(row=11, column=2)
-        self.subtitle_duration = ttk.Entry(frame)
-        self.subtitle_duration.grid(row=11, column=3)
-        self.subtitle_duration.insert(0, "5")
-
-        self.generate_button = ttk.Button(frame, text="アニメーション生成", command=self.generate_animation)
-        self.generate_button.grid(row=12, column=0, columnspan=2)
-
-        self.upload_bg_button = ttk.Button(frame, text="背景アップロード", command=self.upload_background)
-        self.upload_bg_button.grid(row=12, column=2, columnspan=2)
-
-        # 動画を重ね合わせるボタンを追加
-        self.combine_button = ttk.Button(frame, text="動画を重ね合わせる", command=self.combine_videos)
-        self.combine_button.grid(row=12, column=4, columnspan=2)
-
-        #キャラクターTree
-        columns=(["キャラクター","キャラクター", 100],
-                ["声色", "声色", 100],                      
-                ["セリフ", "セリフ", 100],
-                ["layer","layer",100],
-                ["横位置", "横位置", 100],
-                ["開始タイミング", "開始タイミング", 100],
-                ["duration", "duration", 100],
-                ["ボリューム", "ボリューム", 100],
-                ["filename","filename",100])
-        column = [a[0] for a in columns] 
-        self.tree = ttk.Treeview(frame, columns=column, show="headings")
-        for col in columns:
-            self.tree.heading(col[0], text=col[1])
-            self.tree.column(col[0], width=col[2])  # 適切な幅に調整
-        self.tree.grid(row=13, column=0, columnspan=2, padx=5, pady=5, sticky="nsew")
-        
-        self.bg_tree = ttk.Treeview(frame, columns=("開始タイミング", "duration", "ファイル名"), show="headings")
-        self.bg_tree.heading("開始タイミング", text="開始タイミング")
-        self.bg_tree.heading("duration", text="duration")
-        self.bg_tree.heading("ファイル名", text="ファイル名")
-        self.bg_tree.grid(row=14, column=0, columnspan=7, pady=10)
-        self.root.after(100, self.add_layer_dropdowns) #00ミリ秒）を置いて指定したメソッド（self.add_layer_dropdowns）を呼び出す　
-
-    def open_layer_menu(self, item_id, column, x, y): 
-        # 現在の値を取得
-        value = self.tree.item(item_id, "values")
-        current_value = self.tree.item(item_id, "values")[3]
-        # ポップアップメニューを作成
-        popup_menu = tk.Menu(self.root, tearoff=0)
-        for option in self.layer_options:
-            # 現在の値と同じオプションには特別なマークをつけるか、異なるスタイルを適用
-            if option[1] == current_value:
-                popup_menu.add_command(label=option[1] + " (current)", command=lambda opt=option: self.set_layer_value(item_id, column, opt, value))
-            else:
-                popup_menu.add_command(label=option[1], command=lambda opt=option: self.set_layer_value(item_id, column, opt, value))
-    
-        # メニューを表示
-        popup_menu.tk_popup(x, y)
-
-    def set_layer_value(self, item_id, column, opt, value):
-        value = list(value)
-        value[3] = opt[1]
-        filename = 'json/'+ value[-1]
-        with open(filename, 'r') as file:
-            data = json.load(file)
-        data.update(layer = opt[0])        
-        # Treeviewを更新
-        self.tree.item(item_id, values=value)
-
-    def add_layer_dropdowns(self):
-        for row in self.tree.get_children():
-            values = self.tree.item(row)["values"]
-            self.add_layer_dropdown(row, values)
-    def add_layer_dropdown(self, row, values):
-
-        layer_var = tk.StringVar(value=self.layer_options[int(values[3]) - 1][1])
-    
-        def update_layer(*args):
-            for i, item in enumerate(self.layer_options):
-                if item[1] == layer_var.get():
-                    ind = i 
-            self.tree.set(row, "layer", str(ind + 1 ))
-
-        layer_var.trace_add("write", update_layer)
-        layer_menu = ttk.OptionMenu(self.tree, layer_var, layer_var.get(), *self.layer_options)
-        self.tree.set(row, "layer", layer_var.get())
-    
-        # レイヤードロップダウンをTreeviewに追加
-        # Treeviewのアイテム位置を取得して、プルダウンメニューを配置
-        bbox = self.tree.bbox(row, column=3)
-        if bbox:
-            layer_menu.place(x=bbox[0], y=bbox[1], width=bbox[2], height=bbox[3])
-
-
-    def on_character_change(self, event):
-        current_character = self.character_var.get()
-        menu = self.style_menu["menu"]
-        menu.delete(0, "end")
-        for style in self.character_data[current_character].keys():
-            menu.add_command(label=style, command=lambda value=style: self.style_var.set(value))
-
-
-    def on_double_click(self, event):
-        item_id = self.tree.identify_row(event.y)  # クリックされた行のIDを取得
-        column_id = self.tree.identify_column(event.x)  # クリックされた列のIDを取得
-        m = re.findall(r'\d+', item_id)
-        m = int(''.join(m)) -1
-        cell_value = self.tree_insert[m]
-        if column_id == "#8":
-            self.file_popup(cell_value)
-        elif column_id == "#4":
-            self.open_layer_menu(item_id, column_id, event.x_root, event.y_root)
-        else:
-            self.show_popup(cell_value)
-
-    def file_popup(self, cell_value):
-        print("File popup")
-        popup = tk.Toplevel(self.root)
-        popup.title("ポップアップ")
-        ttk.Label(popup, text=f"選択された値: {cell_value}").pack(padx=10, pady=10)
-        popup.transient(self.root)
-        popup.grab_set()
-        self.root.wait_window(popup)
-
-    def delete_animation(self):
-        print("Deleting animation")
-        current_item = self.tree.focus()
-        if not current_item:
-            messagebox.showerror("エラー", "削除するアイテムが選択されていません。")
-            return
-
-        prev_values = self.tree.item(current_item)["values"]
-        self.tree.delete(current_item)
-
-        json_file_path = os.path.join('json', self.cell_value[-1])
-        data = self.load_json_file(json_file_path)
-
-        if data is not None:
-            #data["character"] = character
-            #data["speaker_id"] = speaker_id
-            #data["text"] = text
-            #data["position"] = position
-            data["start_time"] = float(-1)
-            #data["duration"] = float(duration)
-            #data["volume"] = float(volume)
-            with open(json_file_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=4)
-
-        messagebox.showinfo("完了", "アニメーションが削除されました。")
-        self.popup.destroy()
-
-    def update_animation(self):
-        print("Updating animation")
-
-        duration = self.duration_entry.get()
-        position = self.position_var.get()
-        character = self.character_var_popup.get()
-        style = self.style_var_popup.get()
-        text = self.text_entry.get("1.0", "end-1c")
-        volume = self.volume_entry.get()
-        start_time = self.start_time_entry.get()
-        layer = self.layer_entry.get()
-
-        if not duration:
-            messagebox.showerror("エラー", "アニメーションの秒数を入力してください。")
-            return
-
-        current_item = self.tree.focus()
-        if not current_item:
-            messagebox.showerror("エラー", "修正するアイテムが選択されていません。")
-            return
-
-        prev_values = self.tree.item(current_item)["values"]
-        filename = prev_values[-1]
-        speaker_id = self.character_data[character][style]
-
-        new_values = (character, style, text, layer, position, start_time, duration, volume, filename)
-        self.tree.item(current_item, values=new_values)                                                
-        tree_data = []
-        for item in self.tree.get_children():
-            row = self.tree.item(item)["values"]
-            tree_data.append(row)
-
-        df = pd.DataFrame(self.tree_insert, columns=['character', 'style', 'text', 'layer', 'position', 'start_time', 'duration', 'volume', 'filename'])
-        df = df.sort_values(by='start_time')
-        self.tree_insert = df.values.tolist()
-  
-        for ins in self.tree_insert:
-            self.tree.insert("", "end", values=ins)
-
-        json_file_path = os.path.join('json', self.cell_value[-1])
-        data = self.load_json_file(json_file_path)
-
-        if data is not None:
-            data["character"] = character
-            data["speaker_id"] = speaker_id
-            data["text"] = text
-            data["position"] = position
-            data["start_time"] = float(start_time)
-            data["duration"] = float(duration)
-            data["volume"] = float(volume)
-            data["layer"] = int(layer)
-            with open(json_file_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=4)
-
-        messagebox.showinfo("完了", "アニメーションが修正されました。")
-        self.popup.destroy()
-
-    def update_style_menu_popup(self, event):
-        print("Updating style menu for popup")
-        character = self.character_var_popup.get()
-        styles = self.character_data.get(character, {})
-        self.style_menu_popup["values"] = list(styles.keys())
-        self.style_menu_popup.set("")
-
-    def show_popup(self, cell_value):
-        print("Show popup")
-        self.popup = tk.Toplevel(self.root)
-        self.popup.title("修正")
-
-        ttk.Label(self.popup, text="キャラクター").grid(row=0, column=0, sticky=tk.W)
-        self.character_var_popup = tk.StringVar(value=cell_value[0])
-        self.character_menu_popup = ttk.Combobox(self.popup, textvariable=self.character_var_popup, state="readonly")
-        self.character_menu_popup["values"] = list(self.character_data.keys())
-        self.character_menu_popup.grid(row=0, column=1)
-        self.character_menu_popup.bind("<<ComboboxSelected>>", self.update_style_menu_popup)
-
-        ttk.Label(self.popup, text="声色").grid(row=1, column=0, sticky=tk.W)
-        self.style_var_popup = tk.StringVar(value=cell_value[1])
-        self.style_menu_popup = ttk.Combobox(self.popup, textvariable=self.style_var_popup, state="readonly")
-        self.style_menu_popup.grid(row=1, column=1)
-
-        character = self.character_var_popup.get()
-        styles = self.character_data.get(character, {})
-        self.style_menu_popup["values"] = list(styles.keys())
-        self.style_menu_popup.set(cell_value[1])
-
-        ttk.Label(self.popup, text="セリフ").grid(row=2, column=0, sticky=tk.W)
-        self.text_entry = tk.Text(self.popup, height=5, width=60)
-        self.text_entry.grid(row=2, column=1, columnspan=5, sticky=tk.W)
-        self.text_entry.insert("1.0", cell_value[2])
-
-        ttk.Label(self.popup, text="位置選択").grid(row=3, column=0, sticky=tk.W)
-        self.position_var = tk.StringVar(value=cell_value[4])
-        position_options = ["hidden", "left_10", "left_25", "center", "right_25", "right_10"]
-        for i, position in enumerate(position_options):
-            ttk.Radiobutton(self.popup, text=position, variable=self.position_var, value=position).grid(row=3, column=i+1, sticky=tk.W)
-
-        ttk.Label(self.popup, text="レイヤ").grid(row=4, column=0, sticky=tk.W)
-        self.layer_entry = ttk.Entry(self.popup)
-        self.layer_entry.grid(row=4, column=1)
-        self.layer_entry.insert(0, cell_value[3])
-
-        ttk.Label(self.popup, text="開始タイミング (秒)").grid(row=5, column=0, sticky=tk.W)
-        self.start_time_entry = ttk.Entry(self.popup)
-        self.start_time_entry.grid(row=5, column=1)
-        self.start_time_entry.insert(0, cell_value[5])
-
-        ttk.Label(self.popup, text="アニメーションの秒数").grid(row=6, column=0, sticky=tk.W)
-        self.duration_entry = ttk.Entry(self.popup)
-        self.duration_entry.grid(row=6, column=1)
-        self.duration_entry.insert(0, cell_value[6])
-
-        ttk.Label(self.popup, text="ボリューム").grid(row=7, column=0, sticky=tk.W)
-        self.volume_entry = ttk.Entry(self.popup)
-        self.volume_entry.grid(row=7, column=1)
-        self.volume_entry.insert(0, cell_value[7])
-
-        self.cell_value = cell_value
-        self.ok_button = ttk.Button(self.popup, text="修正", command=self.update_animation)
-        self.ok_button.grid(row=9, column=0, columnspan=1)
-
-        self.del_button = ttk.Button(self.popup, text="削除", command=self.delete_animation)
-        self.del_button.grid(row=9, column=1, columnspan=1)
-
-    def add_animation(self):
-        print("Adding animation")
-        duration = self.duration_entry.get()
-        position = self.position_var.get()
-        character = self.character_var_popup.get()
-        style = self.style_var_popup.get()
-        starttime = self.start_time_entry.get()
-        if not duration:
-            messagebox.showerror("エラー", "アニメーションの秒数を入力してください。")
-            return
-
-        current_item = self.tree.focus()
-        if not current_item:
-            messagebox.showerror("エラー", "無音アニメーションを追加する前に、少なくとも1つのアニメーションを生成してください。")
-            return
-
-        prev_values = self.tree.item(current_item)["values"]
-        start_time = prev_values[4]
-
-        speaker_id = self.character_data[character][style]
-        new_start_time = float(start_time) + float(prev_values[5])
-
-
-        json_file = self.animator.create_animation(
-            text="", position=position, silent=True, duration=float(duration), speaker_id=speaker_id
-        )
-
-        json_file_path = os.path.join('json', json_file)
-        data = self.load_json_file(json_file_path)
-
-        if data is not None:
-            data["start_time"] = new_start_time
-            with open(json_file_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=4)
-
-        self.tree.insert("", "end", values=(character, style, "無音", position, new_start_time, duration))
-        messagebox.showinfo("完了", "無音アニメーションが追加されました。")
-        self.popup.destroy()
-
-
-    def upload_background(self):
-        file_path = filedialog.askopenfilename(
-            filetypes=[
-                ("Image files", "*.png *.jpg *.jpeg"),
-                ("Video files", "*.mp4 *.mov"),
-                ("All files", "*.*")
-            ]
-        )
-        if file_path:
-            self.save_background(file_path)
-
-            if file_path.endswith(".mp4") or file_path.endswith(".mov"):
-                clip = mp.VideoFileClip(file_path)
-                duration = clip.duration
-                fps = clip.fps
-                width, height = clip.size
-
-            # JSONファイルの作成
-            json_data = {
-                "backgroudn_file": os.path.basename(file_path),
-                "start_time": 0,
-                "duration": duration,
-            }
-
-            # JSONファイルの連番を取得
-            existing_bg_files = glob.glob('json/background_*.json')
-            json_bg_number = len(existing_bg_files) + 1
-            json_output_path = f'json/background_{json_bg_number}.json'
-
-            with open(json_output_path, 'w', encoding='utf-8') as f:
-                json.dump(json_data, f, ensure_ascii=False, indent=4)
-
-    def save_background(self, file_path):
-        if not os.path.exists('./source'):
-            os.makedirs('./source')
-        shutil.copy(file_path, './source')
-        print(f"Background file {file_path} uploaded to ./source")
-
-    def set_silence(self):
-        print("Setting silence")
-        self.volume_entry.delete(0, tk.END)
-        self.volume_entry.insert(0, "0")
-
-    def update_style_menu(self, event):
-        print("Updating style menu")
-        character = self.character_var.get()
-        styles = self.character_data.get(character, {})
-        self.style_menu["values"] = list(styles.keys())
-        self.style_menu.set("")
-
-    def load_json_file(self, filepath):
-        if not os.path.isfile(filepath):
-            print(f"File does not exist: {filepath}")
-            return None
-        try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                content = f.read()
-                if not content:
-                    print(f"File is empty: {filepath}")
-                    return None
-            return json.loads(content)
-        except json.JSONDecodeError as e:
-            print(f"JSON decode error in file {filepath}: {e}")
-            return None
-
-    def clear_temp_folder(self):
-        temp_files = glob.glob('temp/*')
+        temp_files = glob.glob('temp/*')                            # tempファイル・クリア
         for file in temp_files:
             os.remove(file)
 
-    def generate_animation(self):
-        print("Generating animation")
-        try:
-            character = self.character_var.get()
-            speaker_id = self.character_data[character][self.style_var.get()]
-            text = self.text_entry.get("1.0", "end-1c")
-            position = self.position_var.get()
-            volume = float(self.volume_entry.get())
+        return mov_file, mp4_file
+#########################################################################################################
+class WriteVideoProgress(ProgressBarLogger):
+    def __init__(self, progress_callback, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.progress_callback = progress_callback
+        self.reading_audio = False
 
-            # Animatorクラスのインスタンスを作成し、キャラクターとスピーカーIDを渡す
-            self.animator = Animator(character=character, speaker=speaker_id)
+    def callback(self, *_, **__):
+        pass
 
-            start_time = 0
-            valid_items = []
-            for item in self.tree.get_children():
-                item_data = self.tree.item(item, "values")
-                if float(item_data[5]) >= 0:  # 開始タイミングが0以上のアイテムのみを追加
-                    valid_items.append(item_data)
+    def bars_callback(self, bar, attr, value, old_value=None): 
+        total = self.bars[bar]["total"]
+        if total > 0:
+            progress = int((value / total) * 100)
+            wx.CallAfter(self.progress_callback, progress)
+            print(f"Progress: {progress}%")
 
-            # valid_itemsを開始タイミングでソート
-            valid_items.sort(key=lambda x: float(x[5]))
+#########################################################################################################
+class Combine_videos:
+    def __init__(self, frame): #Animation クラスへのアクセス
+        self.frame = frame
+        self.resolution = resolution
+        self.fps = fps
 
-            silent = False
-            if volume == 0:
-                silent = True
+        self.result_queue = queue.Queue()
+        self.progress = 0
 
-            print(f"Creating animation: character={character}, speaker_id={speaker_id}, text={text}, position={position}, volume={volume}, silent={silent}")
-            title_settings = None
-            subtitle_settings= None
-            mov_file, mp4_file = self.animator.create_animation(
-                text=text, position=position, volume=volume, silent=silent, speaker_id=speaker_id,
-                title_settings={
-                    "text": self.title_text.get("1.0", "end-1c").strip(),
-                    "font_size": int(self.title_font_size.get()),
-                    "font_color": self.title_font_color.get(),
-                    "border_color": self.title_border_color.get(),
-                    "start_time": float(self.title_start_time.get()),
-                    "duration": float(self.title_duration.get()),
-                },
-                subtitle_settings={
-                    "text": self.subtitle_text.get("1.0", "end-1c").strip(),
-                    "font_size": int(self.subtitle_font_size.get()),
-                    "font_color": self.subtitle_font_color.get(),
-                    "border_color": self.subtitle_border_color.get(),
-                    "start_time": float(self.subtitle_start_time.get()),
-                    "duration": float(self.subtitle_duration.get()),
-                }
-            )
+    def get_table_data(self):
+        data = []
+        num_rows = self.frame.table.GetNumberRows() #キャラ画テーブル　行列数
+        num_cols = self.frame.table.GetNumberCols()
 
-            json_file_path = os.path.join('json', f'output_{self.animator.clip_counter - 1}.json')
-            print(f"Attempting to load JSON file from: {json_file_path}")
-            data = self.load_json_file(json_file_path)
+        #　キャラ画
+        for row in range(num_rows):
+            row_values = []
+            for col in range(num_cols):
+                row_value = self.frame.table.GetCellValue(row, col) ## テーブル表の導入
+                row_values.append(row_value)
+            data.append(row_values)
 
-            if data is not None:
-                data["start_time"] = start_time
-                data["title_settings"] = title_settings
-                data["subtitle_settings"] = subtitle_settings
-                with open(json_file_path, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, ensure_ascii=False, indent=4)
+        bg_data = []
+        num_rows = self.frame.bg_table.GetNumberRows() #Backgroundテーブル　行列数
+        num_cols = self.frame.bg_table.GetNumberCols()
 
-            print(f"temp/audio_{self.animator.clip_counter - 1}.wav")
-            duration = VoiceGenerator().get_audio_duration(f"temp/audio_{self.animator.clip_counter - 1}.wav")
-            for item_data in valid_items:
-                self.tree.insert("", "end", values=item_data)
-            self.tree.update()
+        #　Background
+        for row in range(num_rows):
+            row_values = []
+            for col in range(num_cols):
+                row_value = self.frame.bg_table.GetCellValue(row, col) ## テーブル表の導入
+                row_values.append(row_value)
+            bg_data.append(row_values)
+        #print(bg_data)
 
-            # JSONファイルの内容をツリーに反映
-            self.update_tree_from_json()    
+        return (data, bg_data)
 
-            self.clear_temp_folder()
+    def composition(self, progress_callback):  #############################################################################
+        datum = self.get_table_data()
 
-            messagebox.showinfo("Success", f"Animations created: {mov_file}, {mp4_file}")
+        #Background
+        data = datum[1]
+        df = pd.DataFrame(data, columns=['開始タイミング', 'duration', 'ファイル名', 'filename'])
+        #print(df)
 
-        except Exception as e:
-            error_message = traceback.format_exc()
-            print(error_message)
-            messagebox.showerror("Error", error_message)
+        df['layer'] = 0 
+        
+        # キャラ画
+        data = datum[0]
+        # Convert the array to a DataFrame
+        cdf = pd.DataFrame(data, columns=['キャラクター', '声色', 'セリフ', 'layer', '横位置', '開始タイミング', 'duration', 'ボリューム', 'filename'])
 
-    def update_tree_from_json(self):
-        # 既存のアイテムを削除
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        for item in self.bg_tree.get_children():
-            self.bg_tree.delete(item)
+        # Concatenate the DataFrames
+        df = pd.concat([df, cdf], ignore_index=True)
+        df['開始タイミング'] = df['開始タイミング'].astype(float)
+        df['duration'] = df['duration'].astype(float)
+        df['layer'] = df['layer'].astype(float)
+        # Step 1: Remove rows where the 6th column (開始タイミング) contains a negative value
+        df = df[df['開始タイミング'] >= 0]
 
-        self.tree_insert = []
-        self.bg_tree_insert = []
+        # Step 2: Sort by 'layer' and '開始タイミング'
+        df = df.sort_values(by=['layer', '開始タイミング'])
 
-        # JSONファイルを読み込んでツリーに追加
-        json_files = sorted(glob.glob('json/output_*.json'), key=os.path.getmtime)
-        for json_file in json_files:
-            with open(json_file, 'r', encoding='utf-8') as f:
+        # Specify the desired order of columns
+        desired_order = ['layer','開始タイミング', 'duration', 'filename','ファイル名','キャラクター', '声色', 'セリフ', '横位置','ボリューム']
+        # Reorder the columns
+        df = df.reindex(columns=desired_order)
+        sd = df['開始タイミング'] + df['duration']
+        total_duration = sd.max()   #ベース動画終了時間
+
+        # ベース
+        bgpng = 'temp/base_bg.png'
+        bgmov = 'temp/base_bg.mov'
+        img = Image.new('RGBA', (self.resolution[0], self.resolution[1]), (0, 0, 0, 0))
+        img.save(bgpng)
+        print("Running ffmpeg process for base background")
+        process = (
+            ffmpeg
+            .input(bgpng, loop=1, framerate=self.fps)
+            .output(bgmov, vcodec='qtrle', t=total_duration, pix_fmt='argb', r=self.fps)
+            .run()
+        )
+
+        videos=[]
+        for i, vitem in enumerate(df.values.tolist()):
+            print(vitem)
+            layer = vitem[0]
+            start = vitem[1]
+            duration = vitem[2]
+            filename = vitem[3]
+            if layer ==0:
+                print("layer 0")
+                with open(os.path.join('./json', filename), 'r', encoding='utf-8') as file:
+                        data = json.load(file)
+                #background = data['background_file']  　　　バックグラウンド調整
+                movie='source/'+ data['background_file']
+                clip = mp.VideoFileClip(movie, has_mask=True)
+                if clip.duration != duration:
+                    clip = clip.subclip(0, duration)
+                if clip.size[1] > resolution[1]:
+                    clip = clip.resize(height=resolution[1])
+                clip = clip.set_start(start)
+                clip = clip.set_position(("center","center"))
+            else: 
+                #charactor movie                            キャラムービー調整
+                with open(os.path.join('./json', filename), 'r', encoding='utf-8') as file:
+                        data = json.load(file)
+                movie = 'video/' + data['mov_file']
+                clip = mp.VideoFileClip(movie, has_mask=True)
+                if clip.duration != duration:
+                    clip = clip.subclip(0, duration)
+                clip = clip.set_start(start)
+            videos.append([clip,start,duration])
+            if i <1:
+                clips = clip
+            else:
+                clips = mp.CompositeVideoClip([clips, clip], size=self.resolution)
+
+        background_clip = mp.VideoFileClip(bgmov, has_mask=True).set_duration(total_duration)
+        final_clip = mp.CompositeVideoClip([background_clip, clips], size=self.resolution)
+
+
+        # カスタムロガーを設定
+        logger = WriteVideoProgress(progress_callback)
+        final_clip.write_videofile(output, codec="libx264", fps=self.fps, ffmpeg_params=["-pix_fmt", "yuv420p"], logger=logger)
+        #final_clip.write_videofile(output, codec="libx264", fps=self.fps, ffmpeg_params=["-pix_fmt", "yuv420p"])
+          
+        temp_files = glob.glob('temp/*')                            # tempファイル・クリア
+        for file in temp_files:
+            os.remove(file)
+
+        self.result_queue.put("動画処理が完了")
+        return output
+   
+
+#########################################################################################################
+class AnimationGUI(wx.Frame):
+    def __init__(self, *args, **kw):
+        super(AnimationGUI, self).__init__(*args, **kw)
+        self.fps = fps
+
+        self.character_data = {
+            "ずんだもん": {"ノーマル": 3, "あまあま": 1, "ツンツン": 7, "セクシー": 5, "ささやき": 22, "ヒソヒソ": 38, "ヘロヘロ": 75, "なみだめ": 76},
+            "四国めたん": {"ノーマル": 2, "あまあま": 0, "ツンツン": 6, "セクシー": 4, "ささやき": 36, "ヒソヒソ": 37}
+        }
+
+        self.InitUI()
+        self.load_existing_json_files()
+
+    def InitUI(self):
+        panel = wx.lib.scrolledpanel.ScrolledPanel(self)
+        panel.SetupScrolling(scroll_x=True, scroll_y=True)
+        vbox = wx.BoxSizer(wx.VERTICAL)
+
+        # キャラクター選択
+        hbox1 = wx.BoxSizer(wx.HORIZONTAL)
+        st1 = wx.StaticText(panel, label='キャラクター')
+        hbox1.Add(st1, flag=wx.RIGHT, border=8)
+        self.character_combo = wx.ComboBox(panel, choices=list(self.character_data.keys()), style=wx.CB_READONLY)
+        self.character_combo.Bind(wx.EVT_COMBOBOX, self.on_character_select)
+        hbox1.Add(self.character_combo, proportion=1)
+        vbox.Add(hbox1, flag=wx.EXPAND|wx.LEFT|wx.RIGHT|wx.TOP, border=10)
+
+        # 声色選択
+        hbox2 = wx.BoxSizer(wx.HORIZONTAL)
+        st2 = wx.StaticText(panel, label='声色')
+        hbox2.Add(st2, flag=wx.RIGHT, border=8)
+        self.voice_combo = wx.ComboBox(panel, choices=[], style=wx.CB_READONLY)
+        hbox2.Add(self.voice_combo, proportion=1)
+        vbox.Add(hbox2, flag=wx.EXPAND|wx.LEFT|wx.RIGHT|wx.TOP, border=10)
+
+        # セリフ入力
+        hbox3 = wx.BoxSizer(wx.HORIZONTAL)
+        st3 = wx.StaticText(panel, label='セリフ')
+        hbox3.Add(st3, flag=wx.RIGHT, border=8)
+        self.text_ctrl = wx.TextCtrl(panel, style=wx.TE_MULTILINE, size=(400, 50))
+        hbox3.Add(self.text_ctrl, proportion=1, flag=wx.EXPAND)
+        vbox.Add(hbox3, proportion=1, flag=wx.LEFT|wx.RIGHT|wx.TOP|wx.EXPAND, border=10)
+
+        # 位置選択（横並びのラジオボタン）
+        hbox4 = wx.BoxSizer(wx.HORIZONTAL)
+        st4 = wx.StaticText(panel, label='横位置')
+        hbox4.Add(st4, flag=wx.RIGHT, border=8)
+        self.position_choices = ['hidden', 'left_10', 'left_25', 'center', 'right_25', 'right_10']
+        self.position_radio_buttons = []
+        for choice in self.position_choices:
+            rb = wx.RadioButton(panel, label=choice, style=wx.RB_GROUP if choice == 'hidden' else 0)
+            hbox4.Add(rb, flag=wx.RIGHT, border=8)
+            self.position_radio_buttons.append(rb)
+        vbox.Add(hbox4, flag=wx.EXPAND|wx.LEFT|wx.RIGHT|wx.TOP, border=10)
+
+        # その他の入力
+        hbox5 = wx.BoxSizer(wx.HORIZONTAL)
+        st5 = wx.StaticText(panel, label='開始タイミング (秒)')
+        hbox5.Add(st5, flag=wx.RIGHT, border=8)
+        self.start_time_ctrl = wx.TextCtrl(panel)
+        hbox5.Add(self.start_time_ctrl, proportion=1)
+        vbox.Add(hbox5, flag=wx.EXPAND|wx.LEFT|wx.RIGHT|wx.TOP, border=10)
+
+        hbox6 = wx.BoxSizer(wx.HORIZONTAL)
+        st6 = wx.StaticText(panel, label='ボリューム')
+        hbox6.Add(st6, flag=wx.RIGHT, border=8)
+        self.volume_ctrl = wx.TextCtrl(panel, value="1.0")
+        hbox6.Add(self.volume_ctrl, proportion=1)
+        self.set_silence_btn = wx.Button(panel, label='無音')
+        self.set_silence_btn.Bind(wx.EVT_BUTTON, self.on_set_silence)
+        hbox6.Add(self.set_silence_btn, flag=wx.LEFT, border=8)
+        self.silence_duration_ctrl = wx.TextCtrl(panel, value="5")
+        hbox6.Add(self.silence_duration_ctrl, proportion=1)
+        vbox.Add(hbox6, flag=wx.EXPAND|wx.LEFT|wx.RIGHT|wx.TOP, border=10)
+
+        vbox.Add(wx.StaticText(panel, label="無音アニメーションの秒数指定　指定なしだと5秒"), flag=wx.LEFT|wx.RIGHT|wx.TOP, border=10)
+
+        # タイトル設定
+        hbox7 = wx.BoxSizer(wx.HORIZONTAL)
+        st7 = wx.StaticText(panel, label='タイトル')
+        hbox7.Add(st7, flag=wx.RIGHT, border=8)
+        self.title_text_ctrl = wx.TextCtrl(panel, style=wx.TE_MULTILINE, size=(400, 40))
+        hbox7.Add(self.title_text_ctrl, proportion=1, flag=wx.EXPAND)
+        vbox.Add(hbox7, flag=wx.EXPAND|wx.LEFT|wx.RIGHT|wx.TOP, border=10)
+
+        # Combining hbox7, hbox8, and hbox9 into a single horizontal sizer (hbox_combined)
+        hbox_combined = wx.BoxSizer(wx.HORIZONTAL)
+
+        hbox8 = wx.BoxSizer(wx.HORIZONTAL)
+        st8 = wx.StaticText(panel, label='タイトルフォントサイズ')
+        hbox8.Add(st8, flag=wx.RIGHT, border=8)
+        self.title_font_size_ctrl = wx.TextCtrl(panel, value="40")
+        hbox8.Add(self.title_font_size_ctrl, proportion=1)
+        #vbox.Add(hbox8, flag=wx.EXPAND|wx.LEFT|wx.RIGHT|wx.TOP, border=10)
+
+        hbox9 = wx.BoxSizer(wx.HORIZONTAL)
+        st9 = wx.StaticText(panel, label='タイトルフォント色')
+        hbox9.Add(st9, flag=wx.RIGHT, border=8)
+        self.title_font_color_ctrl = wx.TextCtrl(panel, value="white")
+        hbox9.Add(self.title_font_color_ctrl, proportion=1)
+        #vbox.Add(hbox9, flag=wx.EXPAND|wx.LEFT|wx.RIGHT|wx.TOP, border=10)
+
+        hbox10 = wx.BoxSizer(wx.HORIZONTAL)
+        st10 = wx.StaticText(panel, label='タイトル縁取り色')
+        hbox10.Add(st10, flag=wx.RIGHT, border=8)
+        self.title_border_color_ctrl = wx.TextCtrl(panel, value="black")
+        hbox10.Add(self.title_border_color_ctrl, proportion=1)
+        #vbox.Add(hbox10, flag=wx.EXPAND|wx.LEFT|wx.RIGHT|wx.TOP, border=10)
+
+        # Add hbox8, hbox9, and hbox10 to hbox_combined
+        hbox_combined.Add(hbox8, proportion=1, flag=wx.EXPAND|wx.ALL, border=5)
+        hbox_combined.Add(hbox9, proportion=1, flag=wx.EXPAND|wx.ALL, border=5)
+        hbox_combined.Add(hbox10, proportion=1, flag=wx.EXPAND|wx.ALL, border=5)
+        # Add hbox_combined to the main vertical sizer
+        vbox.Add(hbox_combined, flag=wx.EXPAND|wx.LEFT|wx.RIGHT|wx.TOP, border=10)
+
+        # Combining hbox11, hbox12 into a single horizontal sizer (hbox_combined)
+        hbox_combined = wx.BoxSizer(wx.HORIZONTAL)
+
+        hbox11 = wx.BoxSizer(wx.HORIZONTAL)
+        st11 = wx.StaticText(panel, label='タイトル開始タイミング (秒)')
+        hbox11.Add(st11, flag=wx.RIGHT, border=8)
+        self.title_start_time_ctrl = wx.TextCtrl(panel, value="0")
+        hbox11.Add(self.title_start_time_ctrl, proportion=1)
+        #vbox.Add(hbox11, flag=wx.EXPAND|wx.LEFT|wx.RIGHT|wx.TOP, border=10)
+
+        hbox12 = wx.BoxSizer(wx.HORIZONTAL)
+        st12 = wx.StaticText(panel, label='タイトルduration (秒)')
+        hbox12.Add(st12, flag=wx.RIGHT, border=8)
+        self.title_duration_ctrl = wx.TextCtrl(panel, value="5")
+        hbox12.Add(self.title_duration_ctrl, proportion=1)
+        #vbox.Add(hbox12, flag=wx.EXPAND|wx.LEFT|wx.RIGHT|wx.TOP, border=10)
+
+        # Add hbox11, hbox12 to hbox_combined
+        hbox_combined.Add(hbox11, proportion=1, flag=wx.EXPAND|wx.ALL, border=5)
+        hbox_combined.Add(hbox12, proportion=1, flag=wx.EXPAND|wx.ALL, border=5)
+        # Add hbox_combined to the main vertical sizer
+        vbox.Add(hbox_combined, flag=wx.EXPAND|wx.LEFT|wx.RIGHT|wx.TOP, border=10)
+
+        # サブタイトル設定
+        hbox13 = wx.BoxSizer(wx.HORIZONTAL)
+        st13 = wx.StaticText(panel, label='サブタイトル')
+        hbox13.Add(st13, flag=wx.RIGHT, border=8)
+        self.subtitle_text_ctrl = wx.TextCtrl(panel, style=wx.TE_MULTILINE, size=(400, 40))
+        hbox13.Add(self.subtitle_text_ctrl, proportion=1, flag=wx.EXPAND)
+        vbox.Add(hbox13, flag=wx.EXPAND|wx.LEFT|wx.RIGHT|wx.TOP, border=10)
+
+        # Combining hbox14, hbox15, hbox16 into a single horizontal sizer (hbox_combined)
+        hbox_combined = wx.BoxSizer(wx.HORIZONTAL)
+
+        # サブタイトルフォントサイズ
+        hbox14 = wx.BoxSizer(wx.HORIZONTAL)
+        st14 = wx.StaticText(panel, label='サブタイトルフォントサイズ')
+        hbox14.Add(st14, flag=wx.RIGHT, border=8)
+        self.subtitle_font_size_ctrl = wx.TextCtrl(panel, value="30")
+        hbox14.Add(self.subtitle_font_size_ctrl, proportion=1)
+        #vbox.Add(hbox14, flag=wx.EXPAND|wx.LEFT|wx.RIGHT|wx.TOP, border=10)
+
+        # サブタイトルフォント色
+        hbox15 = wx.BoxSizer(wx.HORIZONTAL)
+        st15 = wx.StaticText(panel, label='サブタイトルフォント色')
+        hbox15.Add(st15, flag=wx.RIGHT, border=8)
+        self.subtitle_font_color_ctrl = wx.TextCtrl(panel, value="white")
+        hbox15.Add(self.subtitle_font_color_ctrl, proportion=1)
+        #vbox.Add(hbox15, flag=wx.EXPAND|wx.LEFT|wx.RIGHT|wx.TOP, border=10)
+
+        # サブタイトル縁取り色
+        hbox16 = wx.BoxSizer(wx.HORIZONTAL)
+        st16 = wx.StaticText(panel, label='サブタイトル縁取り色')
+        hbox16.Add(st16, flag=wx.RIGHT, border=8)
+        self.subtitle_border_color_ctrl = wx.TextCtrl(panel, value="black")
+        hbox16.Add(self.subtitle_border_color_ctrl, proportion=1)
+        #vbox.Add(hbox16, flag=wx.EXPAND|wx.LEFT|wx.RIGHT|wx.TOP, border=10)
+
+        # Add hbox14, hbox15, and hbox16 to hbox_combined
+        hbox_combined.Add(hbox14, proportion=1, flag=wx.EXPAND|wx.ALL, border=5)
+        hbox_combined.Add(hbox15, proportion=1, flag=wx.EXPAND|wx.ALL, border=5)
+        hbox_combined.Add(hbox16, proportion=1, flag=wx.EXPAND|wx.ALL, border=5)
+        # Add hbox_combined to the main vertical sizer
+        vbox.Add(hbox_combined, flag=wx.EXPAND|wx.LEFT|wx.RIGHT|wx.TOP, border=10)
+
+        # Combining hbox17, hbox18 into a single horizontal sizer (hbox_combined)
+        hbox_combined = wx.BoxSizer(wx.HORIZONTAL)
+
+        # サブタイトル開始タイミング
+        hbox17 = wx.BoxSizer(wx.HORIZONTAL)
+        st17 = wx.StaticText(panel, label='サブタイトル開始タイミング (秒)')
+        hbox17.Add(st17, flag=wx.RIGHT, border=8)
+        self.subtitle_start_time_ctrl = wx.TextCtrl(panel, value="0")
+        hbox17.Add(self.subtitle_start_time_ctrl, proportion=1)
+        #vbox.Add(hbox17, flag=wx.EXPAND|wx.LEFT|wx.RIGHT|wx.TOP, border=10)
+
+        # サブタイトルduration
+        hbox18 = wx.BoxSizer(wx.HORIZONTAL)
+        st18 = wx.StaticText(panel, label='サブタイトルduration (秒)')
+        hbox18.Add(st18, flag=wx.RIGHT, border=8)
+        self.subtitle_duration_ctrl = wx.TextCtrl(panel, value="5")
+        hbox18.Add(self.subtitle_duration_ctrl, proportion=1)
+        #vbox.Add(hbox18, flag=wx.EXPAND|wx.LEFT|wx.RIGHT|wx.TOP, border=10)
+
+        # Add hbox17, hbox18 to hbox_combined
+        hbox_combined.Add(hbox17, proportion=1, flag=wx.EXPAND|wx.ALL, border=5)
+        hbox_combined.Add(hbox18, proportion=1, flag=wx.EXPAND|wx.ALL, border=5)
+        # Add hbox_combined to the main vertical sizer
+        vbox.Add(hbox_combined, flag=wx.EXPAND|wx.LEFT|wx.RIGHT|wx.TOP, border=10)
+
+
+        # ボタン配置
+        hbox19 = wx.BoxSizer(wx.HORIZONTAL)
+        self.generate_btn = wx.Button(panel, label='アニメーション生成')
+        self.generate_btn.Bind(wx.EVT_BUTTON, self.on_generate)
+        hbox19.Add(self.generate_btn, flag=wx.RIGHT, border=8)
+        self.upload_background_btn = wx.Button(panel, label='背景アップロード')
+        self.upload_background_btn.Bind(wx.EVT_BUTTON, self.on_upload_background)
+        hbox19.Add(self.upload_background_btn, flag=wx.RIGHT, border=8)
+        self.combine_videos_btn = wx.Button(panel, label='動画を重ね合わせる')
+        self.combine_videos_btn.Bind(wx.EVT_BUTTON, self.on_combine_videos)
+        hbox19.Add(self.combine_videos_btn, flag=wx.RIGHT, border=8)
+        #プログレッシブバー
+        # Create a vertical sizer for the progress bars
+        box_progress = wx.BoxSizer(wx.HORIZONTAL)
+
+        # Add the first progress bar to the vertical sizer
+        self.gauge1 = wx.Gauge(panel, range=100, size=(250, 25))
+        box_progress.Add(self.gauge1, 0, wx.ALL | wx.CENTER, 5)
+
+        # Add the second progress bar to the vertical sizer
+        self.gauge2 = wx.Gauge(panel, range=100, size=(250, 25))
+        box_progress.Add(self.gauge2, 0, wx.ALL | wx.CENTER, 5)
+
+        # Add the vertical sizer to the horizontal sizer
+        hbox19.Add(box_progress, flag=wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, border=8)
+
+        # Add the horizontal sizer to the main vertical sizer
+        vbox.Add(hbox19, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, border=10)
+        panel.SetSizer(vbox)
+
+
+        # スクロールパネル for キャラクター用テーブル
+        char_scroll_panel = wx.ScrolledWindow(panel, size=(800, 200), style=wx.SIMPLE_BORDER)
+        char_scroll_panel.SetScrollRate(5, 5)
+
+        # キャラクター用テーブル
+        self.table = wx.grid.Grid(char_scroll_panel)
+        self.table.CreateGrid(5, 9)  # 行数と列数を調整
+        self.table.SetColLabelValue(0, "キャラクター")
+        self.table.SetColLabelValue(1, "声色")
+        self.table.SetColLabelValue(2, "セリフ")
+        self.table.SetColLabelValue(3, "layer")
+        self.table.SetColLabelValue(4, "横位置")
+        self.table.SetColLabelValue(5, "開始タイミング")
+        self.table.SetColLabelValue(6, "duration")
+        self.table.SetColLabelValue(7, "ボリューム")
+        self.table.SetColLabelValue(8, "filename")
+
+        char_scroll_vbox = wx.BoxSizer(wx.VERTICAL)
+        char_scroll_vbox.Add(self.table, 1, wx.EXPAND)
+        char_scroll_panel.SetSizer(char_scroll_vbox)
+        
+        vbox.Add(char_scroll_panel, 1, wx.EXPAND | wx.ALL, 10)
+
+        # Bind the cell change event to a handler
+        self.table.Bind(wx.grid.EVT_GRID_CELL_CHANGED, self.on_cell_change)
+
+
+        # スクロールパネル for 背景アニメーション用テーブル
+        bg_scroll_panel = wx.ScrolledWindow(panel, size=(800, 200), style=wx.SIMPLE_BORDER)
+        bg_scroll_panel.SetScrollRate(5, 5)
+
+        # 背景アニメーション用テーブル
+        self.bg_table = wx.grid.Grid(bg_scroll_panel)
+        self.bg_table.CreateGrid(5, 4)  # 行数と列数を調整
+        self.bg_table.SetColLabelValue(0, "開始タイミング")
+        self.bg_table.SetColLabelValue(1, "duration")
+        self.bg_table.SetColLabelValue(2, "ファイル名")
+        self.bg_table.SetColLabelValue(3, "json")
+
+        bg_scroll_vbox = wx.BoxSizer(wx.VERTICAL)
+        bg_scroll_vbox.Add(self.bg_table, 1, wx.EXPAND)
+        bg_scroll_panel.SetSizer(bg_scroll_vbox)
+        
+        vbox.Add(bg_scroll_panel, 1, wx.EXPAND | wx.ALL, 10)
+
+        # Bind the cell change event to a handler for the background table
+        self.bg_table.Bind(wx.grid.EVT_GRID_CELL_CHANGED, self.on_bg_cell_change)
+
+        panel.SetSizer(vbox)
+
+
+    def on_cell_change(self, event):
+        row = event.GetRow()
+        col = event.GetCol()
+        value = self.table.GetCellValue(row, col)
+        print(f"Cell at row {row}, column {col} changed to {value}")
+        num_col = self.table.GetNumberCols() -1
+        filename = self.table.GetCellValue(row, num_col)
+        #print(filename)
+
+        with open(os.path.join("./json", filename), "r", encoding="utf-8") as f:
                 data = json.load(f)
-                file = os.path.basename(json_file)
-            
-                values = (
-                    data.get("character", ""),
-                    data.get("speaker_id", ""),
-                    data.get("text", ""),
-                    data.get("layer", 1),
-                    data.get("position", ""),
-                    data.get("start_time", 0),
-                    data.get("duration", 0),
-                    data.get("volume", 1.0),
-                    file,
-                )
-                self.tree_insert.append(values)
-                self.tree.insert("", "end", values=values)
+        # Column #3 layer
+        if col == 3:
+            data['layer'] = int(value)
+        elif col == 5:
+            data['start_time'] = float(value)
+        elif col == 6:
+            data['duration'] = float(value)
+        elif col == 7:
+            data['volume'] = float(value)
+        with open(os.path.join("./json", filename), 'w', encoding='utf-8') as file:
+                json.dump(data, file, ensure_ascii=False, indent=4)
+        if col == 5:
+            self.load_existing_json_files() # 表示をstart_time順に並べ替え
+        # Process the updated cell value as needed
+        # For example, update the corresponding JSON data
 
-        bg_files = sorted(glob.glob('json/background_*.json'), key=os.path.getmtime)
-        for bg_file in bg_files:
-            with open(bg_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                values = (
-                    data.get("start_time", 0),
-                    data.get("duration", 0),
-                    data.get("backgroudn_file", ""),
-                )
-                self.bg_tree_insert.append(values)
-                self.bg_tree.insert("", "end", values=values)
+        event.Skip()  # Ensure the event is propagated to other handlers
 
-        self.tree.update()
-        self.bg_tree.update()
-        self.root.after(100, self.add_layer_dropdowns)  # 100ミリ秒後にadd_layer_dropdownsメソッドを呼び出す
-    """
-    def update_tree_from_json(self): 
-        # 既存のアイテムを削除
-        for item in self.tree.get_children():
-            self.tree.delete(item)
+    def on_bg_cell_change(self, event):
+        row = event.GetRow()
+        col = event.GetCol()
+        value = self.bg_table.GetCellValue(row, col)
+        print(f"Background table cell at row {row}, column {col} changed to {value}")
+        num_col = self.bg_table.GetNumberCols() -1
+        filename = self.bg_table.GetCellValue(row, num_col)
+        print(filename)
+        with open(os.path.join("./json", filename), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if col == 0:
+            data['start_time'] = float(value)
+        elif col == 1:
+            data['duration'] = float(value)
+        with open(os.path.join("./json", filename), 'w', encoding='utf-8') as file:
+                json.dump(data, file, ensure_ascii=False, indent=4)
+        if col ==0:
+            self.load_existing_json_files() # 表示をstart_time順に並べ替え
+        # Process the updated cell value as needed
+        # For example, update the corresponding JSON data
 
-        # JSONファイルを読み込んでツリーに追加
-        json_files = sorted(glob.glob('json/output_*.json'), key=os.path.getmtime)
-        for json_file in json_files:
-            with open(json_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                file = os.path.basename(json_file)
-                
-                values = (
-                    data.get("character", ""),
-                    data.get("speaker_id", ""),
-                    data.get("text", ""),
-                    data.get("layer", 1),
-                    data.get("position", ""),
-                    data.get("start_time", 0),
-                    data.get("duration", 0),
-                    data.get("volume", 1.0),
-                    file,
-                    #data.get("title_settings", ""),
-                    #data.get("subtitle_settings", ""),
-                )
-                self.tree.insert("", "end", values=values)
-                
-        self.tree.update()
-        self.root.after(100, self.add_layer_dropdowns) #00ミリ秒）を置いて指定したメソッド（self.add_layer_dropdowns）を呼び出す
-                """
-    
-    def get_style_name(self, speaker_id):
-        print("Getting style name")
-        for character, styles in self.character_data.items():
-            for style_name, id in styles.items():
-                if id == speaker_id:
-                    return style_name
-        return ""
+        event.Skip()  # Ensure the event is propagated to other handlers
+
 
     def load_existing_json_files(self):
-        # Treeviewをクリア
-        for item in self.tree.get_children():
-            self.tree.delete(item)
+        #try:
+            print("load json")
+            self.tree_insert = []
+            self.bg_tree_insert = []
+            # Load existing JSON files (example logic)
+            for filename in os.listdir('./json'):
+                if filename.endswith('.json'):
+                    with open(os.path.join('./json', filename), 'r', encoding='utf-8') as file:
+                        data = json.load(file)
+                        if not "background_" in filename:
+                            character = data["character"]
+                            #style = self.get_style_name(data["speaker_id"])
+                            style = data["speaker_id"]
+                            text = data["text"]
+                            layer = data.get("layer", 1)
+                            position = data["position"]
+                            start_time = data.get("start_time", 0)
+                            duration = data.get("duration", "")
+                            volume = data.get("volume")
+                            self.tree_insert.append((character, style, text, layer, position, start_time, duration, volume, filename))
+                        else:
+                            start_time = data.get("start_time", 0)
+                            start_time = float(start_time)
+                            duration = data.get("duration", "")
+                            duration = float(duration)
+                            file_name = data.get("background_file", "")
+                            self.bg_tree_insert.append((start_time, duration, file_name, filename))
+
+            df = pd.DataFrame(self.tree_insert, columns=['character', 'style', 'text', 'layer', 'position', 'start_time', 'duration', 'volume', 'filename'])
+            df["start_time"] = df["start_time"].astype(float)
+            df = df.sort_values(by='start_time')
+            self.tree_insert = df.values.tolist()
+
+            bg_df = pd.DataFrame(self.bg_tree_insert, columns=['start_time', 'duration', 'file_name', 'filename'])
+            bg_df["start_time"] = bg_df["start_time"].astype(float)
+            bg_df = bg_df.sort_values(by='start_time')
+            self.bg_tree_insert = bg_df.values.tolist()
+
+            self.table.ClearGrid()
+            self.bg_table.ClearGrid()
     
-        self.tree_insert = []
-        self.bg_tree_insert = []
+            # Clear existing rows
+            if self.table.GetNumberRows() >0:
+                self.table.DeleteRows(0, self.table.GetNumberRows(), updateLabels=True)
+            if self.bg_table.GetNumberRows() >0:
+                self.bg_table.DeleteRows(0, self.bg_table.GetNumberRows(), updateLabels=True)
 
-        # JSONファイルのロードロジック
-        for filename in os.listdir('json'):
-            if filename.endswith('.json'):
-                json_file_path = os.path.join('json', filename)
-                data = self.load_json_file(json_file_path)
-                if data is not None:
-                    if not "background_" in json_file_path:
-                        character = data["character"]
-                        style = self.get_style_name(data["speaker_id"])
-                        text = data["text"]
-                        layer = data.get("layer", 1) 
-                        position = data["position"]
-                        start_time = data.get("start_time", 0)
-                        duration = data.get("duration", "")
-                        volume = data.get("volume")
-                        self.tree_insert.append((character, style, text, layer, position, start_time, duration, volume, filename))
-                    else:
-                        start_time = data.get("start_time", 0)
-                        duration = data.get("duration", "")
-                        file_name = data.get("backgroudn_file", "")
-                        self.bg_tree_insert.append((start_time, duration, file_name))
+            for tree in self.tree_insert:
+                self.table.AppendRows(1)
+                row_index = self.table.GetNumberRows() - 1
+                row_index = self.table.GetNumberRows() - 1
+                self.table.SetCellValue(row_index, 0, tree[0])  #data.get('character', ''))
+                style = [k for k, v in self.character_data[tree[0]].items() if v == tree[1]][0]
+                self.table.SetCellValue(row_index, 1, str(style))  #data.get('style
+                self.table.SetCellValue(row_index, 2, tree[2])  #data.get('text', ''))
+                self.table.SetCellValue(row_index, 3, str(tree[3]))  #str(data.get('layer', '')))
+                self.table.SetCellValue(row_index, 4, tree[4])  #data.get('position', ''))
+                self.table.SetCellValue(row_index, 5, str(tree[5]))  #str(data.get('start_time', '')))
+                self.table.SetCellValue(row_index, 6, str(tree[6]))  #str(data.get('duration', '')))
+                self.table.SetCellValue(row_index, 7, str(tree[7]))  #str(data.get('volume', '')))
+                self.table.SetCellValue(row_index, 8, tree[8])  #json_file)
 
+             # Make certain cells read-only
+                self.table.SetReadOnly(row_index, 0, True)  # Make 'キャラクター' column read-only
+                self.table.SetReadOnly(row_index, 1, True) 
+                self.table.SetReadOnly(row_index, 2, True) 
+                self.table.SetReadOnly(row_index, 4, True) 
+                self.table.SetReadOnly(row_index, 8, True)  # Make 'filename' column read-only
 
-        df = pd.DataFrame(self.tree_insert, columns=['character', 'style', 'text', 'layer', 'position', 'start_time', 'duration', 'volume', 'filename'])
-        df = df.sort_values(by='start_time')
-        self.tree_insert = df.values.tolist()
+            for tree in self.bg_tree_insert:
+                self.bg_table.AppendRows(1)
+                bg_row_index = self.bg_table.GetNumberRows() - 1
+                self.bg_table.SetCellValue(bg_row_index, 0, str(tree[0]))   #str(data.get('bg_start_time', '')))
+                self.bg_table.SetCellValue(bg_row_index, 1, str(tree[1]))   #str(data.get('bg_duration', '')))
+                self.bg_table.SetCellValue(bg_row_index, 2, tree[2])   #data.get('bg_file', ''))
+                self.bg_table.SetCellValue(bg_row_index, 3, tree[3])   #json_file)
+
+             # Make certain cells read-only
+                self.bg_table.SetReadOnly(bg_row_index, 2, True)  # Make 'bg file name' column read-only
+                self.bg_table.SetReadOnly(bg_row_index, 3, True)  # Make 'json' column read-only
+
+        #except Exception as e:       
+        #    wx.MessageBox(f"Error loading JSON files: {str(e)}", "Error", wx.OK | wx.ICON_ERROR)
   
-        for ins in self.tree_insert:
-            self.tree.insert("", "end", values=ins)
+    # Event Handlers
+    def on_character_select(self, event):
+        character = self.character_combo.GetValue()
+        styles = list(self.character_data.get(character, {}).keys())
+        self.voice_combo.Set(styles)
+        self.voice_combo.SetSelection(0 if styles else -1)
 
-        bg_df = pd.DataFrame(self.bg_tree_insert, columns=['start_time', 'duration', 'file_name'])
-        bg_df = bg_df.sort_values(by='start_time')
-        self.bg_tree_insert = bg_df.values.tolist()
-        for ins in self.bg_tree_insert:
-            self.bg_tree.insert("", "end", values=(ins))
+    def on_set_silence(self, event):
+        duration = self.silence_duration_ctrl.GetValue()
+        self.text_ctrl.SetValue(f"[silence duration={duration}]")
 
+    #ボタン
+    def on_generate(self, event):
+        def progress_callback(value):
+            wx.CallAfter(self.update_progress_1, value)
 
-    def combine_videos(self):
-        print("Combining videos")
+        if self.character_combo.GetValue() != "" and \
+           self.voice_combo.GetValue() != "" and \
+           self.text_ctrl.GetValue() != "":
+            
+            self.generate_btn.Disable() 
+
+            self.combine_thread = threading.Thread(target=self.generate, args=(progress_callback,))
+            self.combine_thread.start()
+            # スレッドの状態をチェック
+            wx.CallLater(50, self.check_thread_1, self.combine_thread)
+
+    def generate(self, progress_callback):
+        #try:
+            # Extract values from controls
+            character = self.character_combo.GetValue()
+            style = self.voice_combo.GetValue()
+            speaker_id = [v for k, v in self.character_data[character].items() if k == style][0]
+            text = self.text_ctrl.GetValue()
+            position = [rb.GetLabel() for rb in self.position_radio_buttons if rb.GetValue()][0]
+            start_time = self.start_time_ctrl.GetValue()
+            volume = self.volume_ctrl.GetValue()
+            silence_duration = self.silence_duration_ctrl.GetValue()
+            title_text = self.title_text_ctrl.GetValue()
+            title_font_size = self.title_font_size_ctrl.GetValue()
+            title_font_color = self.title_font_color_ctrl.GetValue()
+            title_border_color = self.title_border_color_ctrl.GetValue()
+            title_start_time = self.title_start_time_ctrl.GetValue()
+            title_duration = self.title_duration_ctrl.GetValue()
+            subtitle_text = self.subtitle_text_ctrl.GetValue()
+            subtitle_font_size = self.subtitle_font_size_ctrl.GetValue()
+            subtitle_font_color = self.subtitle_font_color_ctrl.GetValue()
+            subtitle_border_color = self.subtitle_border_color_ctrl.GetValue()
+            subtitle_start_time = self.subtitle_start_time_ctrl.GetValue()
+            subtitle_duration = self.subtitle_duration_ctrl.GetValue()
+
+            #Animatorクラス・create_animationを稼働させる
+            animator = Animator(character=character, speaker=speaker_id)
+
+            # スレッドを使用して重い処理をバックグラウンドで実行
+            animator.create_animation(
+                        text=text, position=position, 
+                        volume=volume, silence_duration=silence_duration, 
+                        speaker_id=speaker_id,
+                        title_settings={
+                            "text": title_text.strip(),
+                            "font_size": int(title_font_size),
+                            "font_color": title_font_color,
+                            "border_color": title_border_color,
+                            "start_time": float(title_start_time),
+                            "duration": float(title_duration),
+                        },
+                        subtitle_settings={
+                            "text": subtitle_text.strip(),
+                            "font_size": int(subtitle_font_size),
+                            "font_color": subtitle_font_color,
+                            "border_color": subtitle_border_color,
+                            "start_time": float(subtitle_start_time),
+                            "duration": float(subtitle_duration),
+                        },
+                        progress_callback=progress_callback, #######################################################
+                    )
+
+            self.load_existing_json_files()
+            wx.MessageBox("アニメーションが生成されました。", "情報", wx.OK | wx.ICON_INFORMATION)
+        #except Exception as e:
+        #    wx.MessageBox(f"Error generating animation: {str(e)}", "Error", wx.OK | wx.ICON_ERROR)
+
+    def on_combine_videos(self, event):
+        def progress_callback(value):
+            wx.CallAfter(self.update_progress_2, value)
+        self.combine_videos_btn.Disable()
+
+        self.combine_thread = threading.Thread(target=self.combine_videos, args=(progress_callback,))
+        self.combine_thread.start()
+        # スレッドの状態をチェック
+        wx.CallLater(50, self.check_thread_2, self.combine_thread)
+
+    def combine_videos(self, progress_callback):
         try:
-            # キャラクター
-            # ツリーに表示されているファイル順に動画を取得
-          
-            layers = {}
-            clips = []
-            for i, item in enumerate(self.tree.get_children()):
-                item_data = self.tree.item(item, "values")
-                filename = self.tree_insert[i]
-                filename = filename[-1]# ファイル名を取得 
-                json_file_path = os.path.join('json', filename)
-
-                char_start_time = item_data[5] # start_time
-                char_duration = item_data[6]   # duration 
-                layer = item_data[3]           # layer
-                for item in self.layer_options:
-                    if layer == item[1]:
-                        layer = item[0]
-                data = self.load_json_file(json_file_path) 
-                print(data)
-                data['layer'] = layer
-                with open(json_file_path, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, ensure_ascii=False, indent=4)
-
-                print(char_start_time, char_duration)
-                if data is not None:
-                    char_movfile = data["mov_file"]
-                    #layer = data["layer"]
-                    if layer not in layers.keys():
-                        layers[layer] = []
-          
-                    #print(char_movfile)
-                    clip = mp.VideoFileClip(char_movfile, has_mask=True) 
-                    clip = clip.subclip(0, char_duration)
-                    clip = clip.set_start(char_start_time)
-                    #clips.append(clip)
-
-                layers[layer].append( [clip, char_start_time, char_duration]) 
-
-            for key, value in layers.items():
-                print(key, value) 
-                layercommand = []  
-                df = None
-                for item in value:
-                    print([item[1],item[2]])
-                    if df is None:
-                        df = pd.DataFrame([[ float(item[1]), float(item[2]) ]], columns=['start', 'duration'])
-                        df['sum'] = df['start'] + df['duration']
-                    else:
-                        dfinner = pd.DataFrame([[ float(item[1]), float(item[2]) ]], columns=['start', 'duration'])
-                        dfinner['sum'] = dfinner['start'] + dfinner['duration']
-                        df = pd.concat([df, dfinner])               
-                    bgduration = df['sum'].max() - df['start'].min()    
-                    layercommand.append( item[0].set_start(item[1]) ) 
-                layercommand.insert(0,  mp.ColorClip(size=resolution, color=(0,0,0,0), duration=bgduration)    )
-
-                layer_clip = mp.CompositeVideoClip(
-                    layercommand,
-                    size=resolution)
-
-                layers[key] = layer_clip
-            print(layers)
-            clips = sorted(layers.items(), reverse=True, key=lambda x: x[0])
-            print(clips)
-            clips = [value for key, value in clips]
-            print(clips)
-
-            # 背景の動画を重ねる
-            bg_clips = []
-            for bg_item in self.bg_tree.get_children():
-                bg_item_data = self.bg_tree.item(bg_item, "values")
-                bg_movfile = bg_item_data[-1]
-                bg_movfile = os.path.basename(bg_movfile)
-                bg_movfile = os.path.join('source', bg_movfile)
-                bg_start_time = bg_item_data[0]
-                bg_duration = bg_item_data[1]           
-                bg_movfile_path = os.path.join('source', os.path.basename(bg_movfile))
-                print( bg_start_time, bg_duration )
-                clip = mp.VideoFileClip(bg_movfile_path).set_start(bg_start_time).set_duration(bg_duration).resize(resolution)
-                bg_clips.append(clip)
-            if bg_clips:
-                clips = bg_clips + clips
-
-            combined_clip = mp.CompositeVideoClip(clips)
-
-
-            print("----------------------------   動画を合成します。")    
-
-            # 動画の保存
-            output_file = "combined_video.mp4"
-            combined_clip.write_videofile(output_file, codec="libx264", fps=24, audio_codec="aac")
-            messagebox.showinfo("Success", f"動画が成功裏に重ね合わされました: {output_file}")
+            Cv = Combine_videos(self)
+            Cv.composition(progress_callback)
         except Exception as e:
-            error_message = traceback.format_exc()
-            print(error_message)
-            messagebox.showerror("Error", error_message)
+            wx.MessageBox(f"Error: {e}", "Error", wx.ICON_ERROR)
 
-if __name__ == "__main__":
-    print("Starting application")
-    root = tk.Tk()
-    app = AnimationGUI(root)
-    root.mainloop()
+    def update_progress_1(self, progress):
+        #wx.CallAfter(self.gauge.SetValue, int(progress * 100))
+        wx.CallAfter(self.gauge1.SetValue, progress)
+        if progress >=100:
+            self.on_thread_complete()
+        else:
+            self.combine_videos_btn.Disable()
+
+    def update_progress_2(self, progress):
+        #wx.CallAfter(self.gauge.SetValue, int(progress * 100))
+        wx.CallAfter(self.gauge2.SetValue, progress)
+        if progress >=100:
+            self.on_thread_complete()
+        else:
+            self.combine_videos_btn.Disable()
+
+    def check_thread_1(self, thread):
+        if thread.is_alive():
+            # スレッドがまだ動作中の場合は、50ミリ秒後に再度チェック
+            wx.CallLater(50, self.check_thread_1, thread)
+        else:
+            # スレッドが完了した場合は、結果を処理
+            self.on_thread_complete()
+
+    def check_thread_2(self, thread):
+        if thread.is_alive():
+            # スレッドがまだ動作中の場合は、50ミリ秒後に再度チェック
+            wx.CallLater(50, self.check_thread_2, thread)
+        else:
+            # スレッドが完了した場合は、結果を処理
+            self.on_thread_complete()
+
+
+    def on_thread_complete(self):
+        # ボタンを再度有効化
+        self.combine_videos_btn.Enable()  ##########################################
+
+    def on_upload_background(self, event):
+        with wx.FileDialog(self, "背景画像または動画を選択", wildcard="Image and Video files (*.png;*.jpg;*.mp4;*.mov)|*.png;*.jpg;*.mp4;*.mov", style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as fileDialog:
+            if fileDialog.ShowModal() == wx.ID_CANCEL:
+                return
+            pathname = fileDialog.GetPath()
+            try:
+                # Process the selected file (image or video)
+                wx.MessageBox(f"選択されたファイル: {pathname}", "情報", wx.OK | wx.ICON_INFORMATION)
+
+                if not os.path.exists('./source'):
+                    os.makedirs('./source')
+                shutil.copy(pathname, './source')
+                print(f"Background file {pathname} uploaded to ./source")
+
+                if pathname.endswith(".mp4") or pathname.endswith(".mov"):
+                    clip = mp.VideoFileClip(pathname)
+                    duration = clip.duration
+                    fps = clip.fps
+                    width, height = clip.size
+                elif pathname.endswith(".png") or pathname.endswith(".jpg"):
+                    duration = 5                                                #アップロード時、デフォルト5秒を仮に設定
+
+                # JSONファイルの作成
+                json_data = {
+                    "background_file": os.path.basename(pathname),
+                    "start_time": 0,
+                    "duration": duration,
+                }
+
+                # JSONファイルの連番を取得
+                existing_bg_files = glob.glob('json/background_*.json')
+                json_bg_number = len(existing_bg_files) + 1
+                json_output_path = f'json/background_{json_bg_number}.json'
+
+                with open(json_output_path, 'w', encoding='utf-8') as f:
+                    json.dump(json_data, f, ensure_ascii=False, indent=4)
+
+                self.load_existing_json_files()
+
+            except Exception as e:
+                wx.MessageBox(f"Error processing file: {str(e)}", "Error", wx.OK | wx.ICON_ERROR)
+
+
+
+
+# Create and run the application
+if __name__ == '__main__':
+
+    temp_files = glob.glob('temp/*')  # tempファイル・クリア
+    for file in temp_files:
+        os.remove(file)
+
+    app = wx.App(False)
+    frame = AnimationGUI(None, title='アニメーション生成 GUI')
+    frame.Show()
+    app.MainLoop()
